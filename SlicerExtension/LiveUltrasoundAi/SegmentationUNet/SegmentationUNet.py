@@ -507,11 +507,11 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       elif self.model_extension == ".pt" or ".pth":
         self.unet_model = smp.Unet(
         encoder_name='resnet18', 
-        encoder_weights=None, 
-        classes=1, 
-        in_channels=3,
-        decoder_use_batchnorm=True,
-        activation='sigmoid',
+        encoder_weights = None, 
+        classes = 1, 
+        in_channels = 3,
+        decoder_use_batchnorm = True,
+        activation = 'sigmoid',
         )
         self.unet_model.load_state_dict(torch.load(modelFullpath))
         self.unet_model.to(DEVICE)
