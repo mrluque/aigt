@@ -27,6 +27,29 @@ import sys
 if not hasattr(sys, 'argv'):  # This patch was needed for a TensorFlow version. Not sure if it's needed anymore.
   sys.argv = ['']
 
+# Load segmentation-models-pytorch
+try:
+  import segmentation_models_pytorch as smp
+except:
+  msg = qt.QMessageBox()
+  msg.setIcon(qt.QMessageBox.Information)
+  msg.setText("Installation of segmentation_models_pytorch is needed.\nClick OK to start installation.\n")
+  msg.setWindowTitle("Installing Required Packages")
+  msg.setStandardButtons(qt.QMessageBox.Ok)
+  msg.setModal(True)
+  retval = msg.exec_()
+  if retval:
+    qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+    slicer.util.pip_install('segmentation-models-pytorch')
+    import segmentation_models_pytorch as smp
+    qt.QApplication.restoreOverrideCursor()
+
+# Load OpenCV
+try:
+  import cv2
+except:
+  logging.error('OpenCV is not installed. Please, install OpenCV...')
+
 try:
   import tensorflow as tf
 except:
@@ -48,6 +71,24 @@ except:
       slicer.util.pip_install('tensorflow scipy scikit-image')
     qt.QApplication.restoreOverrideCursor()
 
+# PyTorch
+try:
+  import torch
+  DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu' # define current device
+except:
+  msg = qt.QMessageBox()
+  msg.setIcon(qt.QMessageBox.Information)
+  msg.setText("Installation of PyTorch is needed.\nClick OK to start installation.\n")
+  msg.setWindowTitle("Installing Required Packages")
+  msg.setStandardButtons(qt.QMessageBox.Ok)
+  msg.setModal(True)
+  retval = msg.exec_()
+  if retval:
+    qt.QApplication.setOverrideCursor(qt.Qt.WaitCursor)
+    slicer.util.pip_install('torch torchvision torchaudio')
+    import torch
+    DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu' # define current device
+    qt.QApplication.restoreOverrideCursor()
 
 #
 # SegmentationUNet
@@ -457,13 +498,28 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       parameterNode.SetParameter(self.AI_MODEL_FULLPATH, "")
       return
     parameterNode.SetParameter(self.AI_MODEL_FULLPATH, modelFullpath)
-
+  
     try:
-      self.unet_model = tf.keras.models.load_model(modelFullpath, compile=False)
-      self.unet_model.call = tf.function(self.unet_model.call)
+      self.model_extension = os.path.splitext(modelFullpath)[1]
+      if self.model_extension == ".h5":
+        self.unet_model = tf.keras.models.load_model(modelFullpath, compile=False)
+        self.unet_model.call = tf.function(self.unet_model.call)
+      elif self.model_extension == ".pt" or ".pth":
+        self.unet_model = smp.Unet(
+        encoder_name='resnet18', 
+        encoder_weights=None, 
+        classes=1, 
+        in_channels=3,
+        decoder_use_batchnorm=True,
+        activation='sigmoid',
+        )
+        self.unet_model.load_state_dict(torch.load(modelFullpath))
+        self.unet_model.to(DEVICE)
+    
       logging.info("Model loaded from file: {}".format(modelFullpath))
       settings = qt.QSettings()
       settings.setValue(self.LAST_AI_MODEL_PATH_SETTING, modelFullpath)
+
     except Exception as e:
       logging.error("Could not load model from file: {}".format(modelFullpath))
       logging.error("Exception: {}".format(str(e)))
@@ -511,18 +567,19 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       input_array = slicer.util.array(inputImageNode.GetID())  # (Z, F, M)
       input_array = input_array[0, :, :]  # (F, M)
 
-      for layer in self.unet_model.layers:
-        if 'input' in layer.name:
-          model_input_shape = layer.input_shape[0]
+      if self.model_extension == ".h5":
+        for layer in self.unet_model.layers:
+          if 'input' in layer.name:
+            model_input_shape = layer.input_shape[0]
 
-      self.slicer_to_model_scaling = (
-        model_input_shape[1] / input_array.shape[0],  # F direction in image
-        model_input_shape[2] / input_array.shape[1],  # M direction in image
-      )
-      self.model_to_slicer_scaling = (
-        input_array.shape[0] / model_input_shape[1],
-        input_array.shape[1] / model_input_shape[2],
-      )
+        self.slicer_to_model_scaling = (
+          model_input_shape[1] / input_array.shape[0],  # F direction in image
+          model_input_shape[2] / input_array.shape[1],  # M direction in image
+        )
+        self.model_to_slicer_scaling = (
+          input_array.shape[0] / model_input_shape[1],
+          input_array.shape[1] / model_input_shape[2],
+        )
 
       # Start observing input image
 
@@ -534,6 +591,7 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       self.inputModifiedObserverTag = inputImageNode.AddObserver(slicer.vtkMRMLScalarVolumeNode.ImageDataModifiedEvent,
                                                                  self.onInputNodeModified)
       self.onInputNodeModified(None, None)  # Compute prediction for current image instead of waiting for an update
+      
     else:
       logging.info("Stopping live segmentation")
       if self.inputModifiedObserverTag is not None:
@@ -653,10 +711,12 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
 
     self.livePredictionProcess.onStarted()
 
+
   def updatePrecitionOnMain(self):
     parameterNode = self.getParameterNode()
     inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
     input_array = slicer.util.array(inputImageNode.GetID())
+
 
     # input_array axis directions (Z, F, M):
     # 1: out of plane = Z
@@ -664,45 +724,75 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
     # 3: transducer mark direction = M
 
     input_image = Image.fromarray(input_array[0, :, :])  # image.width is M, image.height is F
-    resized_input_array = np.array(  # np.array will be (F, M) again, but resize happens in (M, F) axis order
-      input_image.resize(
-        (
-          int(input_image.width * self.slicer_to_model_scaling[1]),  # M direction (width on US machine)
-          int(input_image.height * self.slicer_to_model_scaling[0]),  # F direction (height on US machine)
-        ),
-        resample=Image.BILINEAR
+
+    if self.model_extension == ".h5":
+      resized_input_array = np.array(  # np.array will be (F, M) again, but resize happens in (M, F) axis order
+        input_image.resize(
+          (
+            int(input_image.width * self.slicer_to_model_scaling[1]),  # M direction (width on US machine)
+            int(input_image.height * self.slicer_to_model_scaling[0]),  # F direction (height on US machine)
+          ),
+          resample=Image.BILINEAR
+        )
       )
-    )
-    resized_input_array = np.flip(resized_input_array, axis=0)  # Flip to trained sound direction
-    resized_input_array = resized_input_array / resized_input_array.max()  # Scaling intensity to 0-1
-    resized_input_array = np.expand_dims(resized_input_array, axis=0)  # Add Batch dimension
-    resized_input_array = np.expand_dims(resized_input_array, axis=3)
+      resized_input_array = np.flip(resized_input_array, axis = 0)  # Flip to trained sound direction
+      resized_input_array = resized_input_array / resized_input_array.max()  # Scaling intensity to 0-1
+      resized_input_array = np.expand_dims(resized_input_array, axis = 0)  # Add Batch dimension
+      resized_input_array = np.expand_dims(resized_input_array, axis = 3)
+  
+      y = self.unet_model.predict(resized_input_array)
 
-    y = self.unet_model.predict(resized_input_array)
+      output_array = y[0, :, :, 1]  # Remove batch dimension (F, M)
+      output_array = np.flip(output_array, axis = 0 )  # Flip back to match input sound direction
 
-    output_array = y[0, :, :, 1]  # Remove batch dimension (F, M)
-    output_array = np.flip(output_array, axis=0)  # Flip back to match input sound direction
-
-    apply_logarithmic_transformation = True
-    logarithmic_transformation_decimals = 4
-    if apply_logarithmic_transformation:
-      e = logarithmic_transformation_decimals
-      output_array = np.log10(np.clip(output_array, 10 ** (-e), 1.0) * (10 ** e)) / e
-    output_image = Image.fromarray(output_array)  # F -> height, M -> width
-    upscaled_output_array = np.array(
-      output_image.resize(
-        (
-          int(output_image.width * self.model_to_slicer_scaling[1]),
-          int(output_image.height * self.model_to_slicer_scaling[0]),
-        ),
-        resample=Image.BILINEAR,
+      apply_logarithmic_transformation = True
+      logarithmic_transformation_decimals = 4
+      if apply_logarithmic_transformation:
+        e = logarithmic_transformation_decimals
+        output_array = np.log10(np.clip(output_array, 10 ** (-e), 1.0) * (10 ** e)) / e
+      output_image = Image.fromarray(output_array)  # F -> height, M -> width
+      upscaled_output_array = np.array(
+        output_image.resize(
+          (
+            int(output_image.width * self.model_to_slicer_scaling[1]),
+            int(output_image.height * self.model_to_slicer_scaling[0]),
+          ),
+          resample=Image.BILINEAR,
+        )
       )
-    )
-    upscaled_output_array = upscaled_output_array * 255
-    upscaled_output_array = np.clip(upscaled_output_array, 0, 255)
 
-    outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
-    slicer.util.updateVolumeFromArray(outputImageNode, upscaled_output_array.astype(np.uint8)[np.newaxis, ...])
+      upscaled_output_array = upscaled_output_array * 255
+      upscaled_output_array = np.clip(upscaled_output_array, 0, 255)
+      outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
+      slicer.util.updateVolumeFromArray(outputImageNode, upscaled_output_array.astype(np.uint8)[np.newaxis, ...])
+
+    elif self.model_extension == ".pt" or ".pth":
+
+      resized_input_array = np.array(  # np.array will be (F, M) again, but resize happens in (M, F) axis order
+        input_image.resize(( 256, 256,))
+      )
+
+      resized_input_array = cv2.cvtColor(resized_input_array, cv2.COLOR_BGR2RGB) 
+      
+      #Normalize
+      resized_input_array = resized_input_array.astype(np.float32)
+      mean, std = resized_input_array.mean(), resized_input_array.std()
+      resized_input_array = (resized_input_array - mean) / std
+      resized_input_array = np.clip(resized_input_array, -1.0, 1.0)
+      resized_input_array = (resized_input_array + 1.0) / 2.0
+
+      #Transform numpy array to tensor
+      resized_input_array = np.transpose(resized_input_array, (2, 0, 1))
+      resized_input_array = torch.from_numpy(resized_input_array).to(DEVICE).unsqueeze(0)
+
+      y = self.unet_model.predict(resized_input_array)
+
+      output_array = y.squeeze().cpu().numpy().round()
+      output_array = output_array.astype(np.uint8)*255
+      upscaled_output_array = cv2.resize(output_array, (input_array.shape[2], input_array.shape[1]))
+
+      outputImageNode = parameterNode.GetNodeReference(self.OUTPUT_IMAGE)
+      slicer.util.updateVolumeFromArray(outputImageNode, upscaled_output_array)
 
     # Update output transform, just to be compatible with running separate process
 
@@ -713,6 +803,13 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
       inputTransformMatrix = vtk.vtkMatrix4x4()
       imageTransformNode.GetMatrixTransformToWorld(inputTransformMatrix)
       outputTransformNode.SetMatrixTransformToParent(inputTransformMatrix)
+      outputImageNode.SetAndObserveTransformNodeID(outputTransformNode.GetID())
+    elif imageTransformNode is not None:
+      outputImageNode.SetAndObserveTransformNodeID(imageTransformNode.GetID())
+
+    # Display the the prediction in slice view
+    slicer.util.setSliceViewerLayers(background = inputImageNode, foreground = outputImageNode, foregroundOpacity=0.5)
+    outputImageNode.GetDisplayNode().SetAndObserveColorNodeID("vtkMRMLColorTableNodeYellow")
 
     self.updateOutputFps()  # Update FPS data
 
@@ -768,5 +865,3 @@ class SegmentationUNetTest(ScriptedLoadableModuleTest):
     self.assertEqual(inputScalarRange[1], 279)
 
     self.delayDisplay('Test passed')
-
-
