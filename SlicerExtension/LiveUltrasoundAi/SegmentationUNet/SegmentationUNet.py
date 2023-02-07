@@ -528,7 +528,10 @@ class SegmentationUNetLogic(ScriptedLoadableModuleLogic, VTKObservationMixin):
   def setupProcess(self):
     parameterNode = self.getParameterNode()
     scriptFolder = slicer.modules.segmentationunet.path.replace("SegmentationUNet.py", "")
-    scriptPath = os.path.join(scriptFolder, "Resources", "ProcessScripts", "LivePredictions.slicer.py")
+    if self.model_extension == '.h5':
+     scriptPath = os.path.join(scriptFolder, "Resources", "ProcessScripts", "LivePredictions.slicer.py")
+    elif self.model_extension == '.pt' or '.pth':
+      scriptPath = os.path.join(scriptFolder, "Resources", "ProcessScripts", "LivePredictionsPyTorch.slicer.py")
 
     inputImageNode = parameterNode.GetNodeReference(self.INPUT_IMAGE)
     if inputImageNode is None:
